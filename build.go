@@ -30,14 +30,14 @@ func specialDir(name string) bool {
 	}
 
 	base := filepath.Base(name)
-	if base == "vendor" || base[0] == '_' || base[0] == '.' {
+	if base[0] == '_' || base[0] == '.' {
 		return true
 	}
 
 	return false
 }
 
-// excludePath returns true if the file should not be copied to the new GOPATH.
+// excludePath returns true if the file should not be copied to the new build path.
 func excludePath(name string) bool {
 	ext := path.Ext(name)
 	if ext == ".go" || ext == ".s" {
@@ -52,21 +52,20 @@ func excludePath(name string) bool {
 	return true
 }
 
-// updateGopath builds a valid GOPATH at dst, with all Go files in src/ copied
+// updateBuildpath builds a valid build path at dst, with all Go files in src/ copied
 // to dst/prefix/, so calling
 //
-//   updateGopath("/tmp/gopath", "/home/u/restic", "github.com/restic/restic")
+//   updateBuildpath("/tmp/buildpath", "/home/u/restic", "github.com/restic/restic")
 //
 // with "/home/u/restic" containing the file "foo.go" yields the following tree
-// at "/tmp/gopath":
+// at "/tmp/buildpath":
 //
-//   /tmp/gopath
-//   └── src
-//       └── github.com
+//   /tmp/buildpath
+//   └── github.com
+//       └── restic
 //           └── restic
-//               └── restic
-//                   └── foo.go
-func updateGopath(dst, src, prefix string) error {
+//               └── foo.go
+func updateBuildpath(dst, src, prefix string) error {
 	return filepath.Walk(src, func(name string, fi os.FileInfo, err error) error {
 		if specialDir(name) {
 			if fi.IsDir() {
@@ -90,7 +89,7 @@ func updateGopath(dst, src, prefix string) error {
 		}
 
 		fileSrc := filepath.Join(src, intermediatePath)
-		fileDst := filepath.Join(dst, "src", prefix, intermediatePath)
+		fileDst := filepath.Join(dst, prefix, intermediatePath)
 
 		return copyFile(fileDst, fileSrc)
 	})
@@ -154,7 +153,7 @@ func showUsage(output io.Writer) {
 	fmt.Fprintf(output, "OPTIONS:\n")
 	fmt.Fprintf(output, "  -v     --verbose     output more messages\n")
 	fmt.Fprintf(output, "  -t     --tags        specify additional build tags\n")
-	fmt.Fprintf(output, "  -k     --keep-gopath do not remove the GOPATH after build\n")
+	fmt.Fprintf(output, "  -k     --keep-buildpath do not remove the build path after build\n")
 	fmt.Fprintf(output, "  -T     --test        run tests\n")
 }
 
@@ -180,28 +179,72 @@ func cleanEnv() (env []string) {
 	return env
 }
 
-// build runs "go build args..." with GOPATH set to gopath.
-func build(cwd, gopath string, args ...string) error {
-	args = append([]string{"build"}, args...)
-	cmd := exec.Command("go", args...)
-	cmd.Env = append(cleanEnv(), "GOPATH="+gopath)
-	cmd.Dir = cwd
+var gbPath string
+
+// getgb sets gbPath so that a it contains a valid path to the a executable.
+// The function first looks in the folders in the PATH environment variable of
+// the system and uses the first gb if finds in it. If no gb is available in
+// the system PATH, the function downloads and compiles gb from github, and moves
+// the executable to target.
+func getgb(target string) error {
+	if gbPath != "" {
+		return nil
+	}
+	gb := "gb"
+	if runtime.GOOS == "windows" {
+		gb = "gb.exe"
+	}
+	s, err := exec.LookPath(gb)
+	if err == nil {
+		gbPath = s
+		return nil
+	}
+	// don't consider "not found in path" to be an error
+	if e, ok := err.(*exec.Error); !ok || e.Err != exec.ErrNotFound {
+		return err
+	}
+	buildPath, err := ioutil.TempDir("", "gb-build-")
+	if err != nil {
+		die("TempDir() for gb: %v\n", err)
+	}
+	cmd := exec.Command("go", "get", "github.com/constabulary/gb/...")
+	cmd.Env = append(cleanEnv(), "GOPATH="+buildPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	verbosePrintf("go %s\n", args)
+	verbosePrintf("go get github.com/constabulary/gb/...\n")
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	from := filepath.Join(buildPath, "bin", gb)
+	to := filepath.Join(target, gb)
+	if err := os.Rename(from, to); err != nil {
+		return err
+	}
+	defer os.RemoveAll(buildPath)
+	gbPath = to
+	return nil
+}
+
+// build runs "gb build args..." with buildpath as the working dir.
+func build(cwd, buildpath string, args ...string) error {
+	args = append([]string{"build"}, args...)
+	cmd := exec.Command(gbPath, args...)
+	cmd.Dir = buildpath
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	verbosePrintf("gb %s\n", args)
 
 	return cmd.Run()
 }
 
-// test runs "go test args..." with GOPATH set to gopath.
-func test(cwd, gopath string, args ...string) error {
+// test runs "gb test args..." with buildpath as the working dir.
+func test(cwd, buildpath string, args ...string) error {
 	args = append([]string{"test"}, args...)
-	cmd := exec.Command("go", args...)
-	cmd.Env = append(cleanEnv(), "GOPATH="+gopath)
-	cmd.Dir = cwd
+	cmd := exec.Command(gbPath, args...)
+	cmd.Dir = buildpath
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	verbosePrintf("go %s\n", args)
+	verbosePrintf("gb %s\n", args)
 
 	return cmd.Run()
 }
@@ -290,7 +333,7 @@ func main() {
 		switch arg {
 		case "-v", "--verbose":
 			verbose = true
-		case "-k", "--keep-gopath":
+		case "-k", "--keep-buildpath":
 			keepGopath = true
 		case "-t", "-tags", "--tags":
 			skipNext = true
@@ -323,29 +366,33 @@ func main() {
 		die("Getwd(): %v\n", err)
 	}
 
-	gopath, err := ioutil.TempDir("", "restic-build-")
+	buildpath, err := ioutil.TempDir("", "restic-build-")
 	if err != nil {
 		die("TempDir(): %v\n", err)
 	}
 
-	verbosePrintf("create GOPATH at %v\n", gopath)
-	if err = updateGopath(gopath, filepath.Join(root, "src"), ""); err != nil {
-		die("copying files from %v to %v failed: %v\n", root, gopath, err)
+	if err = getgb(buildpath); err != nil {
+		die("getgb(): %v\n", err)
 	}
 
-	vendor := filepath.Join(root, "vendor", "src")
-	if err = updateGopath(gopath, vendor, ""); err != nil {
-		die("copying files from %v to %v failed: %v\n", root, gopath, err)
+	verbosePrintf("create build path at %v\n", buildpath)
+	if err = updateBuildpath(buildpath, filepath.Join(root, "src"), "src"); err != nil {
+		die("copying files from %v to %v failed: %v\n", root, buildpath, err)
+	}
+
+	vendor := filepath.Join(root, "vendor")
+	if err = updateBuildpath(buildpath, vendor, "vendor"); err != nil {
+		die("copying files from %v to %v failed: %v\n", root, buildpath, err)
 	}
 
 	defer func() {
 		if !keepGopath {
-			verbosePrintf("remove %v\n", gopath)
-			if err = os.RemoveAll(gopath); err != nil {
-				die("remove GOPATH at %s failed: %v\n", err)
+			verbosePrintf("remove %v\n", buildpath)
+			if err = os.RemoveAll(buildpath); err != nil {
+				die("remove build path at %s failed: %v\n", err)
 			}
 		} else {
-			verbosePrintf("leaving temporary GOPATH at %v\n", gopath)
+			verbosePrintf("leaving temporary build path at %v\n", buildpath)
 		}
 	}()
 
@@ -369,21 +416,31 @@ func main() {
 	ldflags := "-s " + constants.LDFlags()
 	verbosePrintf("ldflags: %s\n", ldflags)
 
-	args := []string{
+	var args []string
+	// Disabled because of https://github.com/constabulary/gb/issues/568
+	//if !verbose {
+	//    args = append(args, "-q")
+	//}
+	args = append(args,
 		"-tags", strings.Join(buildTags, " "),
 		"-ldflags", ldflags,
-		"-o", output, "cmd/restic",
-	}
+		"cmd/restic",
+	)
 
-	err = build(filepath.Join(gopath, "src"), gopath, args...)
+	err = build(filepath.Join(buildpath, "src"), buildpath, args...)
 	if err != nil {
 		die("build failed: %v\n", err)
+	}
+
+	err = os.Rename(filepath.Join(buildpath, "bin", "restic-release"), output)
+	if err != nil {
+		die("rename failed: %v\n", err)
 	}
 
 	if runTests {
 		verbosePrintf("running tests\n")
 
-		err = test(filepath.Join(gopath, "src"), gopath, "restic/...")
+		err = test(filepath.Join(buildpath, "src"), buildpath, "restic/...")
 		if err != nil {
 			die("running tests failed: %v\n", err)
 		}
