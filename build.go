@@ -372,7 +372,7 @@ func main() {
 	args := []string{
 		"-tags", strings.Join(buildTags, " "),
 		"-ldflags", ldflags,
-		"-o", output, "restic/cmd/restic",
+		"-o", output, "cmd/restic",
 	}
 
 	err = build(filepath.Join(gopath, "src"), gopath, args...)
